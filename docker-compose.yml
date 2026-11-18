@@ -40,8 +40,10 @@ services:
       ORIGIN_URL: "http://origin:9000"
       PUBLIC_INSTANCES: "http://localhost:8001,http://localhost:8002"
       ORIGIN_TIMEOUT_MS: "2000"
-      CACHE_WAIT_TIMEOUT_MS: "3500"
+      CACHE_WAIT_TIMEOUT_MS: "1000"
       REVALIDATE_TTL_S: "300"
+      ORIGIN_FETCH_CONCURRENCY: "2"
+      FETCH_SLOT_TTL_MS: "10000"
     depends_on:
       redis:
         condition: service_healthy
@@ -66,8 +68,10 @@ services:
       ORIGIN_URL: "http://origin:9000"
       PUBLIC_INSTANCES: "http://localhost:8001,http://localhost:8002"
       ORIGIN_TIMEOUT_MS: "2000"
-      CACHE_WAIT_TIMEOUT_MS: "3500"
+      CACHE_WAIT_TIMEOUT_MS: "1000"
       REVALIDATE_TTL_S: "300"
+      ORIGIN_FETCH_CONCURRENCY: "2"
+      FETCH_SLOT_TTL_MS: "10000"
     depends_on:
       redis:
         condition: service_healthy

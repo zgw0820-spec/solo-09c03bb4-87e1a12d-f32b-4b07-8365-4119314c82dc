@@ -11,6 +11,13 @@ Redis keys (all prefixed with ``artifact:``)::
     {tag}:pub_seq       counter monotonic publication attempt ids
     {tag}:pub_lock      serialises publications for one tag
 
+Cluster-wide origin GET budget (shared by every query instance)::
+
+    fetch_slots         zset   one member per in-flight origin GET; the score
+                                is its expiry timestamp.  The zset cardinality
+                                is the number of slots currently held.
+    fetch_slots:peak    string high-water mark of concurrently held slots
+
 Correctness rules:
 
 * A leader captures the confirmed publication generation *before* calling the
@@ -35,6 +42,21 @@ Correctness rules:
   it exists, readers still get the last confirmed digest but the response is
   explicitly labelled ``stale_due_to_pending`` rather than presented as the
   publication's result.  It expires after ``UNCONFIRMED_TTL_S``.
+* Origin GET requests from both query instances share one Redis semaphore
+  (``fetch_slots``) capped at ``ORIGIN_FETCH_CONCURRENCY`` slots.  Followers
+  waiting on a same-tag leader never take a slot, so all concurrent requests
+  for one tag still consume at most one slot.  Requests that cannot get a slot
+  within ``CACHE_WAIT_TIMEOUT_MS`` fail with an explicit, retryable
+  ``fetch_queue_timeout`` error and never call the origin.  Publication
+  requests do not use the semaphore.
+* A queued leader keeps checking the cache while it waits: if a publication
+  for the tag is confirmed (or another round writes a fresh digest) while it
+  is queued, it returns that digest immediately and never calls the origin.
+* Slots are released only by the token of the request that acquired them.  A
+  late release from an older request cannot free a later holder's slot, and
+  the existing fetch fences ensure a late origin response can never write an
+  older digest back into the cache.  A holder that dies without releasing is
+  reclaimed automatically when its score (acquire time + slot TTL) passes.
 """
 from __future__ import annotations
 
@@ -58,6 +80,9 @@ REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]+$")
 
 STATE_TTL_MS = 7 * 24 * 3600 * 1000
 POLL_INTERVAL_S = 0.04
+# Cluster-wide origin GET budget, shared by every query instance.
+FETCH_SLOTS_KEY = "artifact:fetch_slots"
+FETCH_SLOTS_PEAK_KEY = "artifact:fetch_slots:peak"
 
 
 def _now_ms() -> int:
@@ -201,6 +226,61 @@ if redis.call('HGET', KEYS[1], 'attempt_id') == ARGV[1] then
   return redis.call('DEL', KEYS[1])
 end
 return 0
+"""
+
+# Cluster-wide semaphore for origin GET requests.
+# KEYS[1]=fetch_slots zset, 2=peak string
+# ARGV: 1 token, 2 now_ms, 3 slot ttl ms, 4 capacity, 5 peak ttl seconds
+# Returns {acquired (1/0), inflight_after_prune, peak}.
+#
+# The zset itself carries no key-level TTL: every member's score is its own
+# expiry instant, expired members are pruned on every acquire, and the key is
+# deleted as soon as it becomes empty (see the release script).  A key TTL
+# would be unsafe because a slow origin fetch can outlive it.
+_ACQUIRE_SLOT_LUA = """
+local now = tonumber(ARGV[2])
+local ttl = tonumber(ARGV[3])
+local capacity = tonumber(ARGV[4])
+-- Reclaim slots whose holders died without releasing.
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now)
+local inflight = redis.call('ZCARD', KEYS[1])
+if inflight >= capacity then
+  local peak = tonumber(redis.call('GET', KEYS[2]) or '0')
+  return {0, inflight, peak}
+end
+redis.call('ZADD', KEYS[1], now + ttl, ARGV[1])
+inflight = redis.call('ZCARD', KEYS[1])
+local peak = tonumber(redis.call('GET', KEYS[2]) or '0')
+if inflight > peak then
+  redis.call('SET', KEYS[2], tostring(inflight))
+  peak = inflight
+end
+redis.call('EXPIRE', KEYS[2], ARGV[5])
+return {1, inflight, peak}
+"""
+
+# Only the token of the actual holder may release its own slot, so a late
+# release from an old request can never free a later holder's slot.
+_RELEASE_SLOT_LUA = """
+local removed = redis.call('ZREM', KEYS[1], ARGV[1])
+if removed == 1 and redis.call('ZCARD', KEYS[1]) == 0 then
+  redis.call('DEL', KEYS[1])
+end
+return removed
+"""
+
+# Read the live semaphore state; prune expired holders first.
+_SLOT_STATUS_LUA = """
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
+local inflight = redis.call('ZCARD', KEYS[1])
+local peak = tonumber(redis.call('GET', KEYS[2]) or '0')
+return {inflight, peak}
+"""
+
+_RESET_SLOT_PEAK_LUA = """
+redis.call('SET', KEYS[1], '0')
+redis.call('EXPIRE', KEYS[1], ARGV[1])
+return 1
 """
 
 
@@ -393,6 +473,7 @@ class TagService:
     # ------------------------------------------------------------------ query
     async def get_tag(self, tag: str, refresh: bool = False) -> dict[str, Any]:
         self.validate_tag(tag)
+        started = time.monotonic()
         try:
             snap = await self._miss_snapshot(tag)
         except RedisError as exc:
@@ -406,14 +487,23 @@ class TagService:
         state = snap["state"]
         if not refresh and state and int(state.get("fresh_until") or 0) > _now_ms():
             await self._stat("cache_hits")
-            return self._response(tag, snap, cache_hit=True, role="cache")
+            result = self._response(
+                tag, snap, cache_hit=True, role="cache", extra={"waited_ms": 0}
+            )
+            return result
 
         await self._stat("cache_misses")
-        return await self._fill(
+        # One deadline for the whole miss handling: lock waits and fetch-slot
+        # queueing together may not exceed cache_wait_timeout_ms.
+        result = await self._fill(
             tag,
             baseline_result_seq=snap["result_seq"],
             force=refresh,
         )
+        result.setdefault(
+            "waited_ms", max(0, int((time.monotonic() - started) * 1000))
+        )
+        return result
 
     async def _fill(
         self,
@@ -443,7 +533,9 @@ class TagService:
                 ) from exc
 
             if acquired:
-                return await self._lead_fetch(tag, lock_token, force=force)
+                return await self._lead_fetch(
+                    tag, lock_token, force=force, deadline=deadline
+                )
 
             await self._stat("waits")
             result = await self._wait_for_result(
@@ -455,10 +547,12 @@ class TagService:
                 return result
 
             if time.monotonic() >= deadline:
+                await self._stat("fetch_queue_timeouts")
                 raise ServiceError(
-                    "cache_wait_timeout",
-                    "等待其他实例回源超时，未取得结果，请重试",
-                    504,
+                    "fetch_queue_timeout",
+                    "共享回源名额或同标签回源等待超时（>"
+                    f"{self.s.cache_wait_timeout_ms}ms），未回源，请稍后重试",
+                    503,
                     retryable=True,
                 )
             # Leader disappeared without a usable result: try to become the
@@ -476,8 +570,12 @@ class TagService:
         tag: str,
         lock_token: str,
         force: bool = False,
+        deadline: float | None = None,
     ) -> dict[str, Any]:
         write_token = 0
+        slot_token: str | None = None
+        if deadline is None:
+            deadline = time.monotonic() + self.s.cache_wait_timeout_ms / 1000
         try:
             # Under the lock, re-check whether another instance already filled
             # the cache between our miss and lock acquisition.  Without this a
@@ -498,9 +596,11 @@ class TagService:
                         cache_hit=False,
                         role="leader",
                         coalesced=True,
-                        extra={"coalesced": True},
+                        extra={"coalesced": True, "waited_ms": 0},
                     )
-                # Fence captured before the origin call.
+                # Fence captured before the origin call.  The fetch token is
+                # reserved before we queue for a slot, so any cache write made
+                # by this fetch is fenced even while it is still queueing.
                 expected_gen = int((state_before or {}).get("gen") or 0)
                 write_token = int(await self.redis.incr(_key(tag, "fetch_seq")))
             except RedisError as exc:
@@ -510,6 +610,38 @@ class TagService:
                     503,
                     retryable=True,
                 ) from exc
+
+            # Cluster-wide origin GET budget.  Same-tag requests are still
+            # single-flight (only the lock leader reaches here), so one tag
+            # costs at most one slot; the cap protects the origin when many
+            # different tags miss at once across both instances.
+            slot_token = await self._acquire_fetch_slot(tag, deadline)
+            if slot_token is None:
+                # While queued, a publication for this tag was confirmed (or a
+                # later round wrote a fresh digest).  Return it directly and
+                # never call the origin.
+                snap = await self._snapshot_checked(tag, "读取排队期间确认的摘要")
+                state = snap["state"]
+                if state and int(state.get("fresh_until") or 0) > _now_ms():
+                    return self._response(
+                        tag,
+                        snap,
+                        cache_hit=False,
+                        role="leader",
+                        coalesced=True,
+                        extra={
+                            "coalesced": True,
+                            "queued_short_circuit": True,
+                        },
+                    )
+                await self._stat("fetch_queue_timeouts")
+                raise ServiceError(
+                    "fetch_queue_timeout",
+                    "共享回源名额等待超时（>"
+                    f"{self.s.cache_wait_timeout_ms}ms），未回源，请稍后重试",
+                    503,
+                    retryable=True,
+                )
 
             await self._stat("origin_fetches")
             try:
@@ -636,7 +768,115 @@ class TagService:
                 )
             return self._response(tag, snap, cache_hit=False, role="leader")
         finally:
+            # Release order: slot first, then the per-tag lock.  Both releases
+            # are token-scoped, so cancellation, origin failure or process
+            # exit cannot free another request's slot; a dead holder is also
+            # reclaimed by the slot TTL.
+            if slot_token is not None:
+                await self._release_fetch_slot(slot_token)
             await self._release_lock(_key(tag, "lock"), lock_token)
+
+    # ----------------------------------------------------------- fetch slots
+    async def _fresh_state_for(self, tag: str) -> dict[str, str] | None:
+        try:
+            state = await self.redis.hgetall(_key(tag, "state"))
+        except RedisError as exc:
+            raise ServiceError(
+                "cache_unavailable",
+                f"缓存协调失败，排队期间无法读取状态（{exc.__class__.__name__}），请重试",
+                503,
+                retryable=True,
+            ) from exc
+        if state and int(state.get("fresh_until") or 0) > _now_ms():
+            return state
+        return None
+
+    async def _acquire_fetch_slot(
+        self, tag: str, deadline: float
+    ) -> str | None:
+        """Acquire one cluster-wide origin-GET slot before the origin call.
+
+        Returns the slot token on success.  Returns ``None`` when a fresh
+        digest for this tag was confirmed while queueing (the caller must
+        short-circuit and never call the origin).  Raises a retryable
+        ``fetch_queue_timeout`` when the deadline passes without a slot.
+        """
+        while True:
+            token = uuid.uuid4().hex
+            try:
+                acquired, _inflight, _peak = await self.redis.eval(
+                    _ACQUIRE_SLOT_LUA,
+                    2,
+                    FETCH_SLOTS_KEY,
+                    FETCH_SLOTS_PEAK_KEY,
+                    token,
+                    str(_now_ms()),
+                    str(self.s.fetch_slot_ttl_ms),
+                    str(self.s.origin_fetch_concurrency),
+                    str(STATE_TTL_MS // 1000),
+                )
+            except RedisError as exc:
+                raise ServiceError(
+                    "cache_unavailable",
+                    f"缓存协调失败，无法申请回源名额（{exc.__class__.__name__}），请重试",
+                    503,
+                    retryable=True,
+                ) from exc
+
+            if int(acquired) == 1:
+                await self._stat("slot_acquired")
+                return token
+
+            await self._stat("slot_waits")
+            # While queued, a publication (or another round's successful
+            # fetch) may confirm a fresh digest: return it without ever
+            # calling the origin.
+            if await self._fresh_state_for(tag) is not None:
+                return None
+            if time.monotonic() >= deadline:
+                return None
+            await asyncio.sleep(POLL_INTERVAL_S)
+
+    async def _release_fetch_slot(self, token: str) -> None:
+        try:
+            await self.redis.eval(_RELEASE_SLOT_LUA, 1, FETCH_SLOTS_KEY, token)
+        except RedisError:
+            # The slot TTL reclaims it even if this release is lost.
+            pass
+
+    async def fetch_slot_status(self) -> dict[str, int]:
+        """Live view of the shared origin-GET budget."""
+        try:
+            inflight, peak = await self.redis.eval(
+                _SLOT_STATUS_LUA,
+                2,
+                FETCH_SLOTS_KEY,
+                FETCH_SLOTS_PEAK_KEY,
+                str(_now_ms()),
+            )
+        except RedisError as exc:
+            raise ServiceError(
+                "cache_unavailable",
+                f"缓存协调失败，无法读取回源名额（{exc.__class__.__name__}）",
+                503,
+                retryable=True,
+            ) from exc
+        return {
+            "capacity": self.s.origin_fetch_concurrency,
+            "inflight": int(inflight),
+            "peak": int(peak),
+        }
+
+    async def reset_fetch_slot_peak(self) -> None:
+        try:
+            await self.redis.eval(
+                _RESET_SLOT_PEAK_LUA,
+                1,
+                FETCH_SLOTS_PEAK_KEY,
+                str(STATE_TTL_MS // 1000),
+            )
+        except RedisError:
+            pass
 
     async def _record_fetch_error(
         self,
@@ -1168,7 +1408,16 @@ class TagService:
 
     # ------------------------------------------------------------------ stats
     async def gateway_stats(self) -> dict[str, Any]:
-        names = ["origin_fetches", "origin_errors", "cache_hits", "cache_misses", "waits"]
+        names = [
+            "origin_fetches",
+            "origin_errors",
+            "cache_hits",
+            "cache_misses",
+            "waits",
+            "slot_acquired",
+            "slot_waits",
+            "fetch_queue_timeouts",
+        ]
         try:
             values = await self.redis.mget(
                 [f"stats:gateway:{self.s.instance_name}:{n}" for n in names]
@@ -1215,6 +1464,10 @@ class TagService:
                 502,
                 retryable=True,
             ) from exc
+        if body.get("reset_counters"):
+            # Reset the gateway-side high-water mark together with the origin
+            # counters so a demo round starts from a clean peak.
+            await self.reset_fetch_slot_peak()
         payload["reachable"] = True
         payload["instance"] = self.s.instance_name
         return payload

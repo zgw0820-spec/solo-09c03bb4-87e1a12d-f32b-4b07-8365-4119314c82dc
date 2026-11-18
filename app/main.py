@@ -157,6 +157,8 @@ def _register_routes(app: FastAPI) -> None:
             "origin_timeout_ms": cfg.origin_timeout_ms,
             "cache_wait_timeout_ms": cfg.cache_wait_timeout_ms,
             "revalidate_ttl_s": cfg.revalidate_ttl_s,
+            "origin_fetch_concurrency": cfg.origin_fetch_concurrency,
+            "fetch_slot_ttl_ms": cfg.fetch_slot_ttl_ms,
         }
 
     @app.get("/api/tag/{tag:path}")
@@ -199,11 +201,16 @@ def _register_routes(app: FastAPI) -> None:
         gateway = await service.gateway_stats()
         origin = await service.origin_stats()
         counts = origin.get("request_count")
+        try:
+            fetch_slots = await service.fetch_slot_status()
+        except ServiceError as exc:
+            fetch_slots = {"error": exc.code}
         return {
             "instance": app.state.settings.instance_name,
             "gateway": gateway,
             "origin": origin,
             "origin_request_count": counts,
+            "fetch_slots": fetch_slots,
         }
 
     @app.post("/api/origin/control")

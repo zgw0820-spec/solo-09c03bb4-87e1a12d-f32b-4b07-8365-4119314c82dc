@@ -36,6 +36,11 @@ class Settings:
     revalidate_ttl_s: int
     fetch_state_ttl_s: int
     publish_record_ttl_s: int
+    # Shared cross-instance cap on concurrently in-flight origin GET requests
+    # (both query instances count against the same Redis semaphore).
+    origin_fetch_concurrency: int
+    # A slot holder whose process died is reclaimed once this TTL expires.
+    fetch_slot_ttl_ms: int
     instance_name: str
     public_instances: tuple[str, ...]
 
@@ -53,7 +58,7 @@ class Settings:
             origin_url=_env_str("ORIGIN_URL", "http://localhost:9000").rstrip("/"),
             origin_timeout_ms=_env_int("ORIGIN_TIMEOUT_MS", 2_000, 100, 60_000),
             cache_wait_timeout_ms=_env_int(
-                "CACHE_WAIT_TIMEOUT_MS", 3_500, 100, 60_000
+                "CACHE_WAIT_TIMEOUT_MS", 1_000, 100, 60_000
             ),
             lock_ttl_ms=_env_int("LOCK_TTL_MS", 12_000, 500, 300_000),
             publish_timeout_ms=_env_int("PUBLISH_TIMEOUT_MS", 5_000, 200, 120_000),
@@ -67,6 +72,10 @@ class Settings:
             publish_record_ttl_s=_env_int(
                 "PUBLISH_RECORD_TTL_S", 604_800, 60, 2_592_000
             ),
+            origin_fetch_concurrency=_env_int(
+                "ORIGIN_FETCH_CONCURRENCY", 2, 1, 1_000
+            ),
+            fetch_slot_ttl_ms=_env_int("FETCH_SLOT_TTL_MS", 10_000, 1_000, 300_000),
             instance_name=_env_str("INSTANCE_NAME", "query"),
             public_instances=instances,
         )

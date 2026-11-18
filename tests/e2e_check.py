@@ -181,6 +181,107 @@ async def main() -> int:
     bad_digest = await q1.post("/api/publish", json={"tag": "ok-tag", "digest": "bad digest"})
     check(bad_digest.status_code == 422, f"非法摘要返回 422（实际 {bad_digest.status_code}）")
 
+    # --------------------------- 10. shared origin-GET budget across instances
+    cap_tags = [tag(f"e2e-cap-{i}") for i in range(4)]
+    for t in cap_tags:
+        await origin.post("/publish", json={"tag": t, "digest": f"sha256:cap-{t[-4:]}"})
+        await q1.post("/api/cache/invalidate", json={"tag": t})
+    await origin.post("/control", json={"delay_ms": 600, "reset_counters": True})
+    cap_responses = await asyncio.gather(
+        *[q1.get(f"/api/tag/{cap_tags[0]}"), q2.get(f"/api/tag/{cap_tags[1]}")],
+        *[q1.get(f"/api/tag/{cap_tags[2]}"), q2.get(f"/api/tag/{cap_tags[3]}")],
+    )
+    check(all(r.status_code == 200 for r in cap_responses), "4 个不同标签的并发查询最终全部成功")
+    stats_after = (await q1.get("/api/stats")).json()
+    slots = stats_after.get("fetch_slots", {})
+    check(slots.get("capacity") == 2, f"共享名额上限为 2（实际 {slots.get('capacity')}）")
+    check(slots.get("peak") == 2, f"源站 GET 在途峰值记录为 2（实际 {slots.get('peak')}）")
+    check(slots.get("inflight") == 0, f"全部结束后在途名额归零（实际 {slots.get('inflight')}）")
+    check((await origin.get("/control")).json()["request_count"] == 4,
+          "4 个标签各回源一次，没有请求被丢弃")
+
+    # --------------------------------- 11. queue timeout is explicit/retryable
+    qt_tags = [tag(f"e2e-qt-{i}") for i in range(3)]
+    for t in qt_tags:
+        await origin.post("/publish", json={"tag": t, "digest": "sha256:qt"})
+        await q1.post("/api/cache/invalidate", json={"tag": t})
+    await origin.post("/control", json={"delay_ms": 1500, "reset_counters": True})
+    qt_responses = await asyncio.gather(
+        q1.get(f"/api/tag/{qt_tags[0]}"),
+        q2.get(f"/api/tag/{qt_tags[1]}"),
+        q1.get(f"/api/tag/{qt_tags[2]}"),
+    )
+    statuses = sorted(r.status_code for r in qt_responses)
+    timeout_resp = next((r for r in qt_responses if r.status_code >= 400), None)
+    check(statuses == [200, 200, 503], f"2 个占名额、1 个约 1 秒后报排队超时（实际 {statuses}）")
+    if timeout_resp is not None:
+        err = timeout_resp.json()["error"]
+        check(err["code"] == "fetch_queue_timeout" and err["retryable"] is True,
+              f"排队超时错误明确且可重试（实际 {err.get('code')}）")
+        check(timeout_resp.headers.get("retry-after") == "1", "排队超时带 Retry-After: 1")
+    check((await origin.get("/control")).json()["request_count"] == 2,
+          "排队超时的请求未调用源站")
+    await origin.post("/control", json={"delay_ms": 0})
+    # Wait for the two in-flight fetches to finish and release their slots.
+    await asyncio.sleep(0.6)
+    retry = await q2.get(f"/api/tag/{qt_tags[2]}")
+    check(retry.status_code == 200 and retry.json()["digest"] == "sha256:qt",
+          "排队超时后重试可以成功")
+
+    # ----------------------------------- 12. publish bypasses the fetch budget
+    await origin.post("/control", json={"delay_ms": 700, "reset_counters": True})
+    hold_tags = [tag(f"e2e-hold-{i}") for i in range(2)]
+    for t in hold_tags:
+        await origin.post("/publish", json={"tag": t, "digest": "sha256:hold"})
+        await q1.post("/api/cache/invalidate", json={"tag": t})
+    holders = asyncio.gather(
+        q1.get(f"/api/tag/{hold_tags[0]}"), q2.get(f"/api/tag/{hold_tags[1]}")
+    )
+    await asyncio.sleep(0.15)
+    busy_slots = (await q1.get("/api/stats")).json().get("fetch_slots", {})
+    check(busy_slots.get("inflight") == 2, f"两个查询名额已占满（实际 {busy_slots.get('inflight')}）")
+    pub_tag = tag("e2e-pub-bypass")
+    await origin.post("/publish", json={"tag": pub_tag, "digest": "sha256:base"})
+    await q1.get(f"/api/tag/{pub_tag}")
+    pub = await q2.post(
+        "/api/publish",
+        json={"tag": pub_tag, "digest": "sha256:bypass", "request_id": request_id("e2e-bypass")},
+    )
+    check(pub.status_code == 200 and pub.json()["status"] == "confirmed",
+          "名额占满时发布不受查询名额限制，仍可确认")
+    await holders
+
+    # ------------------------ 13. queued query short-circuits on new publish
+    sc_tag = tag("e2e-short-circuit")
+    await origin.post("/publish", json={"tag": sc_tag, "digest": "sha256:sc-old"})
+    await q1.post("/api/cache/invalidate", json={"tag": sc_tag})
+    await origin.post("/control", json={"delay_ms": 1200, "reset_counters": True})
+    # Occupy both slots with other tags.
+    sc_holds = [tag(f"e2e-sc-hold-{i}") for i in range(2)]
+    for t in sc_holds:
+        await origin.post("/publish", json={"tag": t, "digest": "sha256:hold"})
+        await q1.post("/api/cache/invalidate", json={"tag": t})
+    hold_tasks = asyncio.gather(
+        q1.get(f"/api/tag/{sc_holds[0]}"), q2.get(f"/api/tag/{sc_holds[1]}")
+    )
+    await asyncio.sleep(0.2)
+    queued = asyncio.create_task(q2.get(f"/api/tag/{sc_tag}"))
+    await asyncio.sleep(0.2)
+    check(not queued.done(), "排队中的查询仍在等待名额")
+    sc_pub = await q1.post(
+        "/api/publish",
+        json={"tag": sc_tag, "digest": "sha256:sc-new", "request_id": request_id("e2e-sc")},
+    )
+    check(sc_pub.status_code == 200, "排队期间同标签发布已确认")
+    sc_result = await asyncio.wait_for(queued, timeout=3)
+    body = sc_result.json()
+    check(sc_result.status_code == 200 and body.get("digest") == "sha256:sc-new",
+          f"排队请求直接返回发布确认的新摘要（实际 {body.get('digest')}）")
+    check(body.get("queued_short_circuit") is True and body.get("origin_called") is False,
+          "排队请求未回源，标记 queued_short_circuit")
+    await hold_tasks
+    await origin.post("/control", json={"delay_ms": 0})
+
     await q1.aclose()
     await q2.aclose()
     await origin.aclose()

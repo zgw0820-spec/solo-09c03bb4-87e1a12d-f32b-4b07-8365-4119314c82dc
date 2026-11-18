@@ -171,7 +171,7 @@
     <div class="stack">
       <div class="row">
         <div class="field">
-          <label for="queryTag">标签</label>
+          <label for="queryTag">标签（多个用逗号或空格分隔，可跨两实例并发）</label>
           <input id="queryTag" value="v1.0.0" autocomplete="off" />
         </div>
         <div class="field small">
@@ -185,7 +185,7 @@
         <button id="refreshBtn" class="ghost">强制回源（refresh）</button>
         <button id="invalidateBtn" class="ghost">仅使缓存失效（便于观察单飞）</button>
       </div>
-      <div class="hint">并发查询会同时向两个实例各发 N 个请求。要观察单飞效果：先点「仅使缓存失效」（不改源站、不改发布代号），再点「两实例并发查询」，此时源站计数应只增加 1（并发到达的强制回源请求同样会被合并为一次）。「强制回源」会跳过新鲜度复检，因此一次已完成回源之后再点它，会再真实回源一次，不适合用来验证单飞。</div>
+      <div class="hint">并发查询会同时向两个实例各发 N 个请求（多个标签会交叉排队，最容易观察共享名额）。要观察单飞效果：先点「仅使缓存失效」（不改源站、不改发布代号），再点「两实例并发查询」，此时同标签的源站计数应只增加 1。两实例合计最多 2 个源站 GET 同时在途；排不上名额的请求最多等 1 秒，随后收到可重试的 <code>fetch_queue_timeout</code>。</div>
       <div id="querySummary"></div>
     </div>
   </section>
@@ -210,8 +210,11 @@
         <div class="card"><div class="k">源站请求总数</div><div class="v big" id="originCount">—</div></div>
         <div class="card"><div class="k">当前延迟</div><div class="v" id="originDelay">—</div></div>
         <div class="card"><div class="k">源站状态</div><div class="v" id="originState">—</div></div>
+        <div class="card"><div class="k">源站 GET 在途 / 上限</div><div class="v big" id="slotInflight">—</div></div>
+        <div class="card"><div class="k">在途峰值（Redis 记录）</div><div class="v big" id="slotPeak">—</div></div>
+        <div class="card"><div class="k">本轮观测峰值（网页采样）</div><div class="v big" id="slotObservedPeak">—</div></div>
       </div>
-      <div class="hint">源站计数由源站自身统计，不依赖查询实例，因此可直接验证一轮并发缓存未命中的真实回源次数。</div>
+      <div class="hint">源站计数由源站自身统计，不依赖查询实例，因此可直接验证一轮并发缓存未命中的真实回源次数。「在途 / 上限」与「在途峰值」来自两实例共享的 Redis 名额信号量（同标签请求只占一个名额，发布不占名额）；清零计数会同时重置峰值。</div>
     </div>
   </section>
 
@@ -339,17 +342,21 @@
     }
   }
 
+  function parseTags(raw) {
+    return [...new Set(raw.split(/[\s,]+/).map((t) => t.trim()).filter(Boolean))];
+  }
+
   async function queryOne(base, tag, refresh) {
     const started = performance.now();
     const { ok, status, body } = await fetchJson(
       `${base}/api/tag/${encodeURIComponent(tag)}${refresh ? "?refresh=1" : ""}`
     );
-    return { base, ok, status, body, ms: Math.round(performance.now() - started) };
+    return { base, tag, ok, status, body, ms: Math.round(performance.now() - started) };
   }
 
   async function runQuery(mode) {
-    const tag = $("queryTag").value.trim();
-    if (!tag) { toast("标签不能为空", "err"); return; }
+    const tags = parseTags($("queryTag").value);
+    if (!tags.length) { toast("标签不能为空", "err"); return; }
     const perInstance = mode === "concurrent"
       ? Math.max(1, Math.min(50, parseInt($("parallel").value, 10) || 1))
       : 1;
@@ -360,23 +367,49 @@
     const refresh = mode === "refresh";
     for (const target of targets) {
       for (let i = 0; i < perInstance; i += 1) {
-        jobs.push(queryOne(target.url, tag, refresh).then((r) => ({ ...r, instance: target.name })));
+        for (const tag of tags) {
+          jobs.push(queryOne(target.url, tag, refresh).then((r) => ({ ...r, instance: target.name })));
+        }
       }
     }
-    $("querySummary").innerHTML = `<span class="muted">查询中（${jobs.length} 个并发请求）…</span>`;
-    const results = await Promise.all(jobs);
-    renderResults(tag, results, mode);
+    $("querySummary").innerHTML = `<span class="muted">查询中（${jobs.length} 个并发请求，${tags.length} 个标签）…</span>`;
+
+    // Sample the shared semaphore while the batch is in flight so the page can
+    // show the observed origin-GET concurrency peak alongside Redis' record.
+    let observedPeak = 0;
+    const sampler = setInterval(async () => {
+      try {
+        const res = await fetchJson("/api/stats");
+        const inflight = res.ok ? (res.body.fetch_slots || {}).inflight || 0 : 0;
+        observedPeak = Math.max(observedPeak, inflight);
+        $("slotObservedPeak").textContent = observedPeak;
+        $("slotInflight").textContent = `${inflight} / ${(res.body.fetch_slots || {}).capacity || "—"}`;
+      } catch (_) { /* keep sampling */ }
+    }, 100);
+    let results;
+    try {
+      results = await Promise.all(jobs);
+    } finally {
+      clearInterval(sampler);
+    }
+    renderResults(tags, results, mode, observedPeak);
     refreshStats();
     refreshStatus();
   }
 
-  function renderResults(tag, results, mode) {
+  function renderResults(tags, results, mode, observedPeak) {
     const okResults = results.filter((r) => r.ok);
     const digests = new Set(okResults.map((r) => r.body.digest));
     const leaders = okResults.filter((r) => r.body.single_flight_role === "leader").length;
     const originCalls = okResults.filter((r) => r.body.origin_called).length;
     const followers = okResults.filter((r) => r.body.single_flight_role === "follower").length;
     const hits = okResults.filter((r) => r.body.cache_hit).length;
+    const queueTimeouts = results.filter(
+      (r) => !r.ok && r.body && r.body.error && r.body.error.code === "fetch_queue_timeout"
+    ).length;
+    const shortCircuits = okResults.filter((r) => r.body.queued_short_circuit === true).length;
+    const waited = okResults.map((r) => r.body.waited_ms || 0);
+    const maxWaited = waited.length ? Math.max(...waited) : 0;
     const errors = results.filter((r) => !r.ok);
     const consistent = digests.size <= 1;
     const roleCount = okResults.reduce((acc, r) => {
@@ -385,39 +418,44 @@
     }, {});
     const summary = `
       <div class="cards" style="margin-bottom:10px">
-        <div class="card"><div class="k">请求数</div><div class="v">${results.length}</div></div>
+        <div class="card"><div class="k">请求数 / 标签数</div><div class="v">${results.length} / ${tags.length}</div></div>
         <div class="card"><div class="k">成功 / 错误</div><div class="v"><span class="tag-ok">${okResults.length}</span> / <span class="${errors.length ? "tag-bad" : "muted"}">${errors.length}</span></div></div>
         <div class="card"><div class="k">缓存命中</div><div class="v">${hits}</div></div>
         <div class="card"><div class="k">实际回源</div><div class="v">${originCalls}</div></div>
         <div class="card"><div class="k">领导者 / 等待者</div><div class="v">${leaders} / ${followers}</div></div>
+        <div class="card"><div class="k">排队超时（可重试）</div><div class="v ${queueTimeouts ? "tag-warn" : ""}">${queueTimeouts}</div></div>
+        <div class="card"><div class="k">排队期间被发布短路</div><div class="v">${shortCircuits}</div></div>
+        <div class="card"><div class="k">最长等待</div><div class="v">${maxWaited} ms</div></div>
+        <div class="card"><div class="k">观测在途峰值</div><div class="v">${observedPeak}</div></div>
         <div class="card"><div class="k">摘要一致</div><div class="v ${consistent ? "tag-ok" : "tag-bad"}">${consistent ? (digests.size ? "是" : "无结果") : "否"}</div></div>
       </div>
-      <div class="hint">模式：${esc(mode)} · 标签 <code>${esc(tag)}</code> · 角色分布 ${esc(JSON.stringify(roleCount))}。「实际回源」为本轮真正向源站发起的查询数，可与源站计数增量核对；领导者可能因复用他人刚写入的结果而为 0。</div>`;
+      <div class="hint">模式：${esc(mode)} · 标签 <code>${esc(tags.join(", "))}</code> · 角色分布 ${esc(JSON.stringify(roleCount))}。「实际回源」为本轮真正向源站发起的查询数，可与源站计数增量核对；同标签请求合并为一个名额，不同标签最多 2 个源站 GET 同时在途。</div>`;
     const rows = results.map((r) => {
       if (!r.ok) {
         const e = (r.body && r.body.error) || {};
-        return `<tr><td>${esc(r.instance)}</td><td class="tag-bad">错误</td><td class="mono">${esc(e.code || "error")}</td>
+        return `<tr><td>${esc(r.instance)}</td><td class="mono">${esc(r.tag)}</td><td class="tag-bad">错误</td><td class="mono">${esc(e.code || "error")}</td>
           <td colspan="3">${esc(e.message || "")} ${e.retryable ? '<span class="tag-warn">可重试</span>' : ""}</td>
           <td class="mono">${r.ms}ms</td></tr>`;
       }
       const b = r.body;
       return `<tr>
         <td>${esc(r.instance)}</td>
+        <td class="mono">${esc(r.tag)}</td>
         <td class="mono">${esc(b.digest)}</td>
         <td>${b.cache_hit ? '<span class="tag-ok">命中</span>' : (b.origin_called ? '<span class="tag-warn">回源</span>' : '<span class="tag-ok">复用</span>')}</td>
         <td class="mono">${esc(b.single_flight_role)}</td>
         <td>${esc(b.generation)}</td>
-        <td>${esc((b.publication || {}).status || "")}${b.fenced_by_publish ? ' <span class="tag-warn">发布栅栏</span>' : ""}${b.stale_due_to_pending ? ' <span class="tag-warn">旧值</span>' : ""}</td>
-        <td class="mono">${r.ms}ms</td></tr>`;
+        <td>${esc((b.publication || {}).status || "")}${b.fenced_by_publish ? ' <span class="tag-warn">发布栅栏</span>' : ""}${b.queued_short_circuit ? ' <span class="tag-ok">排队短路</span>' : ""}${b.stale_due_to_pending ? ' <span class="tag-warn">旧值</span>' : ""}</td>
+        <td class="mono">${r.ms}ms${b.waited_ms ? ` <span class="muted">(等 ${b.waited_ms}ms)</span>` : ""}</td></tr>`;
     }).join("");
     $("detailWrap").innerHTML = `${summary}
       <table>
-        <thead><tr><th>实例</th><th>摘要</th><th>缓存</th><th>角色</th><th>代号</th><th>发布状态</th><th>耗时</th></tr></thead>
+        <thead><tr><th>实例</th><th>标签</th><th>摘要</th><th>缓存</th><th>角色</th><th>代号</th><th>发布状态</th><th>耗时</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>`;
-    $("querySummary").innerHTML = `<div class="hint">最近一轮：${results.length} 请求，${originCalls} 次实际回源，${followers} 等待，${hits} 缓存命中${errors.length ? `，${errors.length} 个错误` : ""}。</div>`;
+    $("querySummary").innerHTML = `<div class="hint">最近一轮：${results.length} 请求（${tags.length} 标签），${originCalls} 次实际回源，${followers} 等待，${hits} 缓存命中，${queueTimeouts} 个排队超时，观测在途峰值 ${observedPeak}${errors.length ? `，${errors.length} 个错误` : ""}。</div>`;
     if (errors.length) toast(`本轮有 ${errors.length} 个错误：${errText(errors[0].body, errors[0].status)}`, "err");
-    else if (mode === "concurrent") toast(`并发完成：${originCalls} 次实际回源、${followers} 个等待者、${hits} 次缓存命中`, "ok");
+    else if (mode === "concurrent") toast(`并发完成：${originCalls} 次实际回源、${followers} 个等待者、观测在途峰值 ${observedPeak}`, "ok");
   }
 
   async function refreshStats() {
@@ -433,6 +471,9 @@
     $("originCount").textContent = origin.reachable ? (origin.request_count ?? "—") : "不可达";
     $("originDelay").textContent = origin.reachable ? `${origin.delay_ms ?? 0} ms` : "—";
     $("originState").textContent = origin.reachable ? "可达" : "不可达";
+    const slots = body.fetch_slots || {};
+    $("slotInflight").textContent = slots.error ? "不可读" : `${slots.inflight ?? "—"} / ${slots.capacity ?? "—"}`;
+    $("slotPeak").textContent = slots.error ? "不可读" : (slots.peak ?? "—");
     if (origin.reachable && document.activeElement !== $("delayMs")) $("delayMs").value = origin.delay_ms ?? 0;
   }
 
@@ -472,14 +513,16 @@
   }
 
   async function invalidate() {
-    const tag = $("queryTag").value.trim();
-    if (!tag) { toast("标签不能为空", "err"); return; }
-    const { ok, status, body } = await fetchJson("/api/cache/invalidate", {
+    const tags = parseTags($("queryTag").value);
+    if (!tags.length) { toast("标签不能为空", "err"); return; }
+    const outcomes = await Promise.all(tags.map((tag) => fetchJson("/api/cache/invalidate", {
       method: "POST",
       body: JSON.stringify({ tag }),
-    });
-    if (!ok) { toast(`失效失败：${errText(body, status)}`, "err"); return; }
-    toast(body.invalidated ? `已使 ${tag} 的缓存失效（保留代号 ${body.generation}），下一轮查询会重新回源` : `${tag} 尚无缓存`, "ok");
+    })));
+    const failed = outcomes.find((r) => !r.ok);
+    if (failed) { toast(`失效失败：${errText(failed.body, failed.status)}`, "err"); return; }
+    const hadCache = outcomes.filter((r) => r.body.invalidated).length;
+    toast(`已处理 ${tags.length} 个标签，其中 ${hadCache} 个原有缓存已标记失效，下一轮查询会重新回源`, "ok");
     refreshStats();
     refreshStatus();
   }

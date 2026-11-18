@@ -89,6 +89,8 @@ def make_settings(**overrides) -> Settings:
         "revalidate_ttl_s": 300,
         "fetch_state_ttl_s": 30,
         "publish_record_ttl_s": 1000,
+        "origin_fetch_concurrency": 2,
+        "fetch_slot_ttl_ms": 5000,
         "instance_name": "test",
         "public_instances": ("http://a", "http://b"),
     }
@@ -512,3 +514,201 @@ async def test_request_id_reuse_with_different_digest_rejected(env):
     assert excinfo.value.code == "request_id_reused"
     got = await a.get_tag("v1")
     assert got["digest"] == "sha256:one"
+
+
+# ----------------------------------------------------- shared origin-GET budget
+
+@pytest.mark.asyncio
+async def test_origin_gets_globally_capped_at_two_concurrent(env):
+    _redis, origin, (a, b) = env
+    for i in range(3):
+        origin.seed(f"cap-{i}", f"sha256:{i}")
+    origin.delay = 0.3
+    results = await asyncio.gather(
+        a.get_tag("cap-0"),
+        b.get_tag("cap-1"),
+        a.get_tag("cap-2"),
+    )
+    assert {r["digest"] for r in results} == {"sha256:0", "sha256:1", "sha256:2"}
+    # The third tag had to queue: at no point were three origin GETs in flight.
+    assert origin.max_concurrent <= 2
+    assert origin.calls == 3
+    status = await a.fetch_slot_status()
+    assert status == {"capacity": 2, "inflight": 0, "peak": 2}
+
+
+@pytest.mark.asyncio
+async def test_queue_timeout_is_retryable_and_never_calls_origin(env):
+    _redis, origin, (a, b) = env
+    for idx in range(3):
+        origin.seed(f"qt-{idx}", f"sha256:{idx}")
+    origin.delay = 0.4
+    for svc in (a, b):
+        svc.s = make_settings(
+            cache_wait_timeout_ms=200,
+            origin_fetch_concurrency=2,
+            instance_name=svc.s.instance_name,
+        )
+    results = await asyncio.gather(
+        a.get_tag("qt-0"),
+        b.get_tag("qt-1"),
+        a.get_tag("qt-2"),
+        return_exceptions=True,
+    )
+    errors = [r for r in results if isinstance(r, ServiceError)]
+    assert len(errors) == 1
+    assert errors[0].code == "fetch_queue_timeout"
+    assert errors[0].status_code == 503
+    assert errors[0].retryable is True
+    assert origin.max_concurrent <= 2
+    assert origin.calls == 2
+    # Slots were released by the two successful fetches.
+    assert (await a.fetch_slot_status())["inflight"] == 0
+
+    # A later request gets a slot immediately once the queue drains.
+    origin.delay = 0
+    got = await b.get_tag("qt-2")
+    assert got["digest"] == "sha256:2"
+    assert origin.calls == 3
+    assert (await a.fetch_slot_status())["inflight"] == 0
+
+
+@pytest.mark.asyncio
+async def test_publish_is_not_limited_by_fetch_slots(env):
+    _redis, origin, (a, b) = env
+    origin.seed("pub-cap", "sha256:old")
+    # Saturate the whole origin-GET budget with two long, distinct-tag fetches.
+    origin.delay = 0.4
+    for i in range(2):
+        origin.seed(f"hold-{i}", f"sha256:hold{i}")
+    holders = asyncio.gather(a.get_tag("hold-0"), b.get_tag("hold-1"))
+    await asyncio.sleep(0.05)
+    assert (await a.fetch_slot_status())["inflight"] == 2
+
+    # Publication uses POST /publish and must not wait for a query slot.
+    published = await a.publish("pub-cap", "sha256:new", "req-cap")
+    assert published["status"] == "confirmed"
+    await holders
+    assert (await a.fetch_slot_status())["inflight"] == 0
+    got = await b.get_tag("pub-cap")
+    assert got["digest"] == "sha256:new"
+
+
+@pytest.mark.asyncio
+async def test_queued_request_returns_confirmed_publish_without_origin(env):
+    from app import cache as cache_module
+
+    redis, origin, (a, b) = env
+    origin.seed("queue-pub", "sha256:old")
+    # Hold every slot with unrelated tokens whose scores lie in the future so
+    # the service's expired-holder reaping does not remove them.
+    far_future = cache_module._now_ms() + 600_000
+    await redis.zadd(
+        "artifact:fetch_slots",
+        {"held-token-1": far_future, "held-token-2": far_future + 1},
+    )
+    await redis.pexpire("artifact:fetch_slots", 600_000)
+    for svc in (a, b):
+        svc.s = make_settings(cache_wait_timeout_ms=3000)
+
+    queued = asyncio.create_task(b.get_tag("queue-pub"))
+    await asyncio.sleep(0.1)
+    assert not queued.done()
+
+    # A publication for the same tag confirms while the request is queued.
+    published = await a.publish("queue-pub", "sha256:new", "req-queued")
+    result = await asyncio.wait_for(queued, timeout=2)
+    assert result["digest"] == "sha256:new"
+    assert result["queued_short_circuit"] is True
+    assert result["origin_called"] is False
+    assert result["generation"] == published["generation"]
+    # The queued request never touched the origin.
+    assert origin.calls == 0
+    # The manually held slots were never borrowed or released by the service.
+    status = await a.fetch_slot_status()
+    assert status["inflight"] == 2
+    await redis.zrem("artifact:fetch_slots", "held-token-1", "held-token-2")
+
+
+@pytest.mark.asyncio
+async def test_cancelled_request_releases_its_slot(env):
+    redis, origin, (a, b) = env
+    origin.seed("cancel-tag", "sha256:x")
+    origin.delay = 0.5
+    task = asyncio.create_task(a.get_tag("cancel-tag"))
+    await asyncio.sleep(0.1)
+    assert (await b.fetch_slot_status())["inflight"] == 1
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # Give the finally block a tick to run.
+    await asyncio.sleep(0.05)
+    assert (await b.fetch_slot_status())["inflight"] == 0
+    # Lock is released as well, so another instance can take over.
+    assert await redis.exists("artifact:cancel-tag:lock") == 0
+
+    origin.delay = 0
+    # The cancelled fetch never wrote a cache entry, so the retry fetches once
+    # more; the important guarantee is that the freed slot let it run at all.
+    got = await b.get_tag("cancel-tag")
+    assert got["digest"] == "sha256:x"
+    assert origin.calls == 2
+    assert (await b.fetch_slot_status())["inflight"] == 0
+
+
+@pytest.mark.asyncio
+async def test_origin_failure_releases_slot_and_is_retryable(env):
+    _redis, origin, (a, b) = env
+    origin.seed("fail-tag", "sha256:x")
+    origin.fail_next = 1
+    origin.delay = 0.1
+    with pytest.raises(ServiceError) as excinfo:
+        await a.get_tag("fail-tag")
+    assert excinfo.value.code == "origin_error"
+    assert excinfo.value.retryable is True
+    assert (await b.fetch_slot_status())["inflight"] == 0
+    got = await b.get_tag("fail-tag")
+    assert got["digest"] == "sha256:x"
+    assert origin.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_late_release_of_unknown_token_frees_nothing(env):
+    redis, origin, (a, b) = env
+    origin.seed("token-tag", "sha256:x")
+    origin.delay = 0.3
+    task = asyncio.create_task(a.get_tag("token-tag"))
+    await asyncio.sleep(0.1)
+    members = await redis.zrange("artifact:fetch_slots", 0, -1)
+    assert len(members) == 1
+    real_token = members[0]
+    # A stale request releasing a token it never held must not free the slot.
+    removed = await redis.eval(
+        __import__("app.cache", fromlist=["_RELEASE_SLOT_LUA"])._RELEASE_SLOT_LUA,
+        1,
+        "artifact:fetch_slots",
+        "some-other-old-token",
+    )
+    assert int(removed) == 0
+    assert (await b.fetch_slot_status())["inflight"] == 1
+    result = await task
+    assert result["digest"] == "sha256:x"
+    assert real_token not in (await redis.zrange("artifact:fetch_slots", 0, -1))
+    assert (await a.fetch_slot_status())["inflight"] == 0
+
+
+@pytest.mark.asyncio
+async def test_same_tag_concurrency_still_uses_one_slot(env):
+    _redis, origin, (a, b) = env
+    origin.seed("same-tag", "sha256:one")
+    origin.delay = 0.3
+    results = await asyncio.gather(
+        *[a.get_tag("same-tag") for _ in range(4)],
+        *[b.get_tag("same-tag") for _ in range(4)],
+    )
+    assert {r["digest"] for r in results} == {"sha256:one"}
+    assert origin.calls == 1
+    assert origin.max_concurrent == 1
+    status = await a.fetch_slot_status()
+    assert status["inflight"] == 0
+    assert status["peak"] <= 1
